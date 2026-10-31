@@ -764,3 +764,72 @@ def test_visual_images_are_bounded_across_tool_rounds(monkeypatch):
     assert images == ["data:image/png;base64,10", "data:image/png;base64,11"]
     assert guard_estimates[2] >= 2 * IMAGE_TOKEN_GUARD_RESERVE
     assert "base64" not in str(result.messages)
+
+
+def test_relative_asset_reference_is_matched_by_basename(tmp_path: Path):
+    """MinerU references figures as paths relative to its parse workdir."""
+    kb_dir, source, image, parsed = _fixture(tmp_path)
+    relative = ParsedDocument(
+        markdown=parsed.markdown,
+        blocks=[
+            {
+                "type": "image",
+                "img_path": f"/parse/workdir/images/{image.name}",
+                "page_idx": 4,
+                "image_caption": ["Figure from a relative reference"],
+            }
+        ],
+        asset_dir=parsed.asset_dir,
+        source_hash=parsed.source_hash,
+        parser_signature=parsed.parser_signature,
+        engine=parsed.engine,
+    )
+
+    record = collect_visual_assets(relative, source, kb_dir)[0].record
+
+    assert record["caption"] == "Figure from a relative reference"
+    assert record["page_number"] == 5
+
+
+def test_asset_lookup_cost_does_not_grow_with_block_count(tmp_path: Path, monkeypatch):
+    """Regression: resolving both paths per block made large books quadratic."""
+    kb_dir, source, image, parsed = _fixture(tmp_path)
+    resolutions = {"count": 0}
+    real_resolve = Path.resolve
+
+    def counting_resolve(self, *args, **kwargs):
+        resolutions["count"] += 1
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", counting_resolve)
+
+    def resolutions_for(text_blocks: int) -> int:
+        blocks = [
+            {"type": "text", "text": f"paragraph {index}", "page_idx": index % 7}
+            for index in range(text_blocks)
+        ]
+        blocks.append(
+            {
+                "type": "image",
+                "img_path": f"images/{image.name}",
+                "page_idx": 3,
+                "image_caption": ["Finder"],
+            }
+        )
+        candidate = ParsedDocument(
+            markdown=parsed.markdown,
+            blocks=blocks,
+            asset_dir=parsed.asset_dir,
+            source_hash=parsed.source_hash,
+            parser_signature=parsed.parser_signature,
+            engine=parsed.engine,
+        )
+        resolutions["count"] = 0
+        records = collect_visual_assets(candidate, source, kb_dir)
+        assert records[0].record["caption"] == "Finder"
+        return resolutions["count"]
+
+    few = resolutions_for(5)
+    many = resolutions_for(500)
+
+    assert many <= few + 5

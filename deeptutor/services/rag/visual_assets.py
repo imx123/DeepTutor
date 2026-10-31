@@ -104,53 +104,78 @@ def _text(value: Any) -> str:
     return ""
 
 
+def _asset_key(value: Any) -> str:
+    """Cheap identity for a parser image reference.
+
+    MinerU and PyMuPDF4LLM both name extracted images after their content hash
+    and reference them by a path whose basename is that file, so comparing
+    basenames is enough — and unlike ``Path.resolve()`` it costs no syscall.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return os.path.basename(text.replace("\\", "/"))
+
+
+def _index_blocks_by_asset(blocks: list[dict[str, Any]] | None) -> dict[str, tuple[int, dict]]:
+    """Map asset basename to ``(block index, block)`` in one pass over ``blocks``."""
+    index: dict[str, tuple[int, dict]] = {}
+    for position, block in enumerate(blocks or []):
+        if not isinstance(block, dict):
+            continue
+        key = _asset_key(block.get("img_path") or block.get("path"))
+        if key and key not in index:
+            index[key] = (position, block)
+    return index
+
+
 def _block_details(
-    blocks: list[dict[str, Any]] | None, asset: Path
+    blocks: list[dict[str, Any]] | None,
+    asset: Path,
+    block_index: dict[str, tuple[int, dict]] | None = None,
 ) -> tuple[str, str, int | None, int | None, list[float] | None, str]:
     if not blocks:
         return "", "", None, None, None, ""
-    for index, block in enumerate(blocks):
-        if not isinstance(block, dict):
-            continue
-        raw = str(block.get("img_path") or block.get("path") or "")
-        if not raw or Path(raw).resolve() != asset.resolve():
-            continue
-        caption = _text(
-            block.get("caption")
-            or block.get("image_caption")
-            or block.get("chart_caption")
-            or block.get("table_caption")
-            or block.get("captions")
+    lookup = block_index if block_index is not None else _index_blocks_by_asset(blocks)
+    hit = lookup.get(_asset_key(asset.name))
+    if hit is None:
+        return "", "", None, None, None, ""
+    index, block = hit
+    caption = _text(
+        block.get("caption")
+        or block.get("image_caption")
+        or block.get("chart_caption")
+        or block.get("table_caption")
+        or block.get("captions")
+    )
+    context = _text(block.get("text") or block.get("content"))
+    if not context:
+        neighbors = blocks[max(0, index - 1) : index] + blocks[index + 1 : index + 2]
+        context = " ".join(
+            _text(item.get("text") or item.get("content"))
+            for item in neighbors
+            if isinstance(item, dict)
+        ).strip()
+    has_page_index = block.get("page_idx") is not None
+    page_raw = block.get("page_idx") if has_page_index else block.get("page")
+    try:
+        page_value = int(page_raw) if page_raw is not None else None
+    except (ValueError, TypeError):
+        page_value = None
+    page_index = page_value if has_page_index else None
+    page_number = (
+        (page_value + 1 if has_page_index else page_value) if page_value is not None else None
+    )
+    raw_bbox = block.get("bbox")
+    try:
+        bbox = (
+            [float(value) for value in raw_bbox[:4]]
+            if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) >= 4
+            else None
         )
-        context = _text(block.get("text") or block.get("content"))
-        if not context:
-            neighbors = blocks[max(0, index - 1) : index] + blocks[index + 1 : index + 2]
-            context = " ".join(
-                _text(item.get("text") or item.get("content"))
-                for item in neighbors
-                if isinstance(item, dict)
-            ).strip()
-        has_page_index = block.get("page_idx") is not None
-        page_raw = block.get("page_idx") if has_page_index else block.get("page")
-        try:
-            page_value = int(page_raw) if page_raw is not None else None
-        except (ValueError, TypeError):
-            page_value = None
-        page_index = page_value if has_page_index else None
-        page_number = (
-            (page_value + 1 if has_page_index else page_value) if page_value is not None else None
-        )
-        raw_bbox = block.get("bbox")
-        try:
-            bbox = (
-                [float(value) for value in raw_bbox[:4]]
-                if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) >= 4
-                else None
-            )
-        except (ValueError, TypeError):
-            bbox = None
-        return caption[:500], context[:500], page_index, page_number, bbox, f"blocks.json#/{index}"
-    return "", "", None, None, None, ""
+    except (ValueError, TypeError):
+        bbox = None
+    return caption[:500], context[:500], page_index, page_number, bbox, f"blocks.json#/{index}"
 
 
 def _markdown_details(markdown: str, asset: Path) -> tuple[str, str, str]:
@@ -182,6 +207,8 @@ def collect_visual_assets(
         return []
     source_key = source_key_for(kb_dir, source)
     source_hash = _sha256_file(source)
+    blocks = parsed.blocks or []
+    block_index = _index_blocks_by_asset(blocks)
     candidates: list[VisualAssetCandidate] = []
     for path in sorted(asset_dir.iterdir()):
         try:
@@ -196,7 +223,7 @@ def collect_visual_assets(
         image, mime = loaded
         image_hash = sha256(image).hexdigest()
         caption, context, page_index, page_number, bbox, locator = _block_details(
-            parsed.blocks, path
+            blocks, path, block_index
         )
         md_caption, md_context, md_locator = _markdown_details(parsed.markdown, path)
         caption = caption or md_caption
@@ -226,15 +253,9 @@ def collect_visual_assets(
         from deeptutor.services.rag.source_visuals import figure_labels
 
         record["figure_labels"] = figure_labels(caption)
-        matching = [
-            block
-            for block in (parsed.blocks or [])
-            if isinstance(block, dict)
-            and str(block.get("img_path") or block.get("path") or "")
-            and Path(str(block.get("img_path") or block.get("path"))).resolve() == path.resolve()
-        ]
-        if matching:
-            block = matching[0]
+        matched = block_index.get(_asset_key(path.name))
+        block = matched[1] if matched else None
+        if block:
             record.update(
                 {
                     "kind": str(block.get("type") or "image"),
